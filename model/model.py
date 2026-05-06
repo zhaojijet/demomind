@@ -78,7 +78,7 @@ class demoMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from torch.nn import functional as F
 from .activation_functions import ACT2FN
 
@@ -450,7 +450,11 @@ class demoMindBlock(nn.Module):
         use_cache=False,
         attention_mask=None,
     ):
+        # 残差连接模式：先做LayerNorm -> Attention -> 残差相加 -> LayerNorm -> FFN -> 残差相加
+        # 保存残差以供后续相加
         residual = hidden_states
+
+        # 注意力子层：输入先归一化（RMSNorm），返回hidden_states和present_key_value（用于cache）
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states),
             position_embeddings,
@@ -459,7 +463,10 @@ class demoMindBlock(nn.Module):
             attention_mask,
         )
 
+        # 注意力输出与残差相加
         hidden_states = residual + hidden_states
+
+        # 前馈子层（post-attention layernorm）并相加
         hidden_states = hidden_states + self.mlp(
             self.past_attention_layernorm(hidden_states)
         )
@@ -485,7 +492,7 @@ class demoMindModel(nn.Module):
 
         # ROPE预计算
         freq_cos, freq_sin = precompute_freqs_cis(
-            dim=config.hidden_size // config.num_hidden_layers,
+            dim=config.hidden_size // config.num_attention_heads,
             end=config.max_position_embeddings,
             rope_base=config.rope_theta,
             rope_scaling=config.rope_scaling,
@@ -497,40 +504,53 @@ class demoMindModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         **kwargs,
     ):
+
+        # input_ids: [bsz, seq_len]
         batch_size, seq_len = input_ids.shape
-        if hasattr(past_key_value, "layers"):
-            past_key_value = None
 
-        past_key_value = past_key_value or [None] * len(self.layers)
+        # 兼容性检查：某些框架会传入包含.layers属性的对象，视为不携带past信息
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
 
+        # past_key_values为每层的(past_k, past_v)列表，如果为None则创建与层数相同的None列表
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        # past_key_values[0] 形如 (k, v)，k.shape = [bsz, past_seq_len, n_kv_heads, head_dim]
         start_pos = (
-            past_key_value[0][0].shape(1) if past_key_value(0) is not None else 0
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         )
+
+        # Embedding + dropout
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
+        # 从注册的buffer中取出对应位置范围的cos/sin作为position_embeddings
+        # self.freqs_cos/freqs_sin的shape为 [max_pos, head_dim]
         position_embeddings = (
             self.freqs_cos[start_pos : start_pos + seq_len],
             self.freqs_sin[start_pos : start_pos + seq_len],
         )
 
-        present = []
+        # 逐层前向，通过zip把layer和对应的past_key_value配对
+        presents = []
 
-        for layer_idx, (layer, past_key_values) in enumerate(
+        for layer_idx, (layer, past_key_value) in enumerate(
             zip(self.layers, past_key_values)
         ):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
-                past_key_value=past_key_values,
+                past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
             )
-            present.append(present)
+            presents.append(present)
 
+        # 最后做归一化
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, present
+        return hidden_states, presents
