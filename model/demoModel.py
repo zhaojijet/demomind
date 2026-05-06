@@ -78,9 +78,11 @@ class demoMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 from torch.nn import functional as F
-from .activation_functions import ACT2FN
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class RMSNorm(nn.Module):
@@ -146,7 +148,7 @@ def precompute_freqs_cis(
         )
 
         # 推断长度大于训练长度，使用缩放
-        if end > orig_max:
+        if end / orig_max > 1.0:
             # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
             inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (
                 2 * math.log(rope_base)
@@ -193,7 +195,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # [a, b] -> [-b, a]
     def rotate_half(x):
         return torch.cat(
-            [-x[..., x.shape(-1) // 2 :], x[..., : x.shape(-1) // 2]], dim=-1
+            [-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1
         )
 
     # x_rotated=x*cos+rotate_half(x)*sin
@@ -264,7 +266,6 @@ class Attention(nn.Module):
 
         # 设置注意力头配置
         self.n_local_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
         self.n_rep = self.n_local_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
@@ -293,14 +294,14 @@ class Attention(nn.Module):
         # Flash Attention需要PyTorch >= 2.0
         self.flash = (
             hasattr(torch.nn.functional, "scaled_dot_product_attention")
-            and args.flash_attn
+            and args.flash_attention
         )
         # 如果不支持可以打印警告: print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(
         self,
         x: torch.Tensor,
-        position_embedding: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
@@ -322,7 +323,7 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         # position_embeddings是预计算的(cos, sin)，按序列位置切片并应用RoPE
-        cos, sin = position_embedding
+        cos, sin = position_embeddings
         # 只取当前序列长度的前缀（用于inference时从start_pos开始）
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
@@ -373,11 +374,11 @@ class Attention(nn.Module):
             # 标准实现：scores = Q @ K^T / sqrt(d)
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             # causal mask: 上三角（对角线以上）置为 -inf，防止看到未来信息
-            casule_mask = torch.triu(
+            causal_mask = torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1,
             )
-            scores = scores + casule_mask.unsqueeze(0).unsqueeze(0)
+            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
 
             # 如果有attention_mask(0/1)，将其扩展后转为 -1e9 的加性mask（掩掉pad位置）
             if attention_mask is not None:
@@ -411,9 +412,9 @@ class FeedForward(nn.Module):
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.drop_out = nn.Dropout(args.dropout)
+        self.dropout = nn.Dropout(args.dropout)
         # ACT2FN是transformers里激活函数的映射表，支持'silu','gelu'等
-        self.act_fn = ACT2FN(args.hidden_act)
+        self.act_fn = ACT2FN[args.hidden_act]
 
     def forward(self, x):
         """
@@ -477,6 +478,7 @@ class demoMindBlock(nn.Module):
 class demoMindModel(nn.Module):
     def __init__(self, config: demoMindConfig):
         super().__init__()
+        self.config = config
         self.vocab_size, self.num_hidden_layers = (
             config.vocab_size,
             config.num_hidden_layers,
@@ -485,7 +487,7 @@ class demoMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
-            demoMindBlock(i, config) for i in range(self.num_hidden_layers)
+            [demoMindBlock(i, config) for i in range(self.num_hidden_layers)]
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -554,3 +556,48 @@ class demoMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states, presents
+
+
+class demoMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = demoMindConfig
+
+    def __init__(self, config: demoMindConfig):
+        super().__init__(config)
+        self.model = demoMindModel(config)
+        self.lm_head = nn.Linear(
+            self.config.hidden_size, self.config.vocab_size, bias=False
+        )
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        return CausalLMOutputWithPast(
+            loss=None,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
